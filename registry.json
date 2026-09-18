@@ -6,7 +6,7 @@
       "name": "Qoder",
       "description": "Qoder (qoder.cn / qoder.com) device-code login, model discovery and wasm-signed chat execution for CLIProxyAPI.",
       "author": "Qoder CPA Plugin",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "repository": "https://github.com/jingjingxinshang/qoder-cliproxy-plugin",
       "homepage": "https://github.com/jingjingxinshang/qoder-cliproxy-plugin",
       "license": "MIT",

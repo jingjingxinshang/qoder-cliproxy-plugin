@@ -80,7 +80,7 @@ func TestMisconfiguredRegionIsRejected(t *testing.T) {
 // The device URL carries the parameters a live login sends. Two of them were
 // missing before, and a login started without them yields a token the follow-up
 // calls reject.
-func TestDeviceAuthURLCarriesTheLiveParameters(t *testing.T) {
+func TestDeviceAuthURLMatchesTheCLI(t *testing.T) {
 	region := RegionFor("cn")
 	authURL := region.DeviceAuthURL("challenge-value", "nonce-value", "machine-value")
 	parsed, err := url.Parse(authURL)
@@ -96,14 +96,23 @@ func TestDeviceAuthURLCarriesTheLiveParameters(t *testing.T) {
 		"nonce":            "nonce-value",
 		"machine_id":       "machine-value",
 		"client_id":        ClientID,
-		"redirect_uri":     RedirectURI,
-		"directLogin":      "true",
 	}
 	query := parsed.Query()
 	for key, value := range want {
 		if got := query.Get(key); got != value {
 			t.Fatalf("auth url %s = %q, want %q", key, got, value)
 		}
+	}
+	// Both of these look harmless and both were added here once before, which is
+	// what earned OAuthRedirectURIInvalid: the server checks redirect_uri against
+	// the client's registered list, and this flow has none.
+	for _, forbidden := range []string{"redirect_uri", "directLogin"} {
+		if query.Has(forbidden) {
+			t.Fatalf("auth url carries %s, which the device flow must not send: %s", forbidden, authURL)
+		}
+	}
+	if len(query) != len(want) {
+		t.Fatalf("auth url carries %d parameters, want exactly %d: %s", len(query), len(want), authURL)
 	}
 	// The global region uses its own page.
 	if global := RegionFor("global").DeviceAuthURL("c", "n", "m"); !strings.HasPrefix(global, "https://qoder.com/device/selectAccounts?") {

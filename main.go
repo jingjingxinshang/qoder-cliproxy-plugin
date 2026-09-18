@@ -47,7 +47,7 @@ import (
 const (
 	providerID = "qoder"
 	pluginName = "Qoder"
-	pluginVer  = "0.1.0"
+	pluginVer  = "0.1.1"
 
 	// loginTTL bounds how long an unapproved device code stays usable. The code
 	// is approved by hand in a browser, so this is minutes, not seconds.

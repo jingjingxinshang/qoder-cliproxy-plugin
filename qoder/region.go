@@ -125,10 +125,21 @@ func guardHost(hostname string) error {
 
 // DeviceAuthURL builds the URL the user opens to approve a device login.
 //
-// The parameters mirror what the desktop client sends, including the two the
-// first implementation missed (`redirect_uri`, `directLogin`): a login started
-// without them is not bound the same way, and the token that comes back is not
-// usable for the follow-up calls.
+// DeviceAuthURL is the URL the user approves a device login on.
+//
+// The parameter set is exactly the CLI's own, read out of the shipped bundle:
+//
+//	new URLSearchParams({challenge, challenge_method: "S256", nonce,
+//	  machine_id, client_id: ktc})
+//	`${base}/device/selectAccounts?${params}`
+//
+// redirect_uri and directLogin do NOT belong here. Adding them makes the server
+// answer OAuthRedirectURIInvalid, because it validates redirect_uri against the
+// client's registered list and this flow has none: redirect_uri belongs to the
+// IDE's browser authorization-code flow, which posts to /authorize with
+// response_type and code_challenge. Conflating the two flows is what broke this
+// once already. machine_token is also part of the CLI's set, but only when a
+// machine token exists; it is omitted here for the same reason the CLI omits it.
 func (r Region) DeviceAuthURL(challenge, nonce, machineID string) string {
 	query := url.Values{}
 	query.Set("challenge", challenge)
@@ -136,15 +147,16 @@ func (r Region) DeviceAuthURL(challenge, nonce, machineID string) string {
 	query.Set("nonce", nonce)
 	query.Set("machine_id", machineID)
 	query.Set("client_id", ClientID)
-	query.Set("redirect_uri", RedirectURI)
-	query.Set("directLogin", "true")
 	return strings.TrimRight(r.DevicePage, "/") + "/device/selectAccounts?" + query.Encode()
 }
 
 const (
-	// ClientID is the public client every Qoder client uses.
+	// ClientID is the public client the CLI's device flow uses. The bundle keeps
+	// it obfuscated (`ktc`, base64 then XOR with a fixed key) and decodes to this
+	// value, which is the default the flow selects over the alternative Rtc
+	// client id (e93fe488-5778-4c35-a6fc-0f54ed7b3139).
 	ClientID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
-	// RedirectURI is the deep link the desktop client registers, present in the
-	// device URL of a live login.
+	// RedirectURI belongs to the IDE's browser authorization-code flow (the deep
+	// link it registers). The device flow must NOT send it: see DeviceAuthURL.
 	RedirectURI = "qoder://aicoding.aicoding-agent/login-success"
 )

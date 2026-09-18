@@ -84,7 +84,11 @@ func TestE2ESignedTraffic(t *testing.T) {
 	// accepted request returns a stream we can decrypt, and a rejected one
 	// names the field it wanted. Both outcomes are printed verbatim.
 	target := firstNonEmpty(os.Getenv("QODER_E2E_MODEL"), models[0].ID)
-	e2eChat(t, &auth, target)
+	module, errModule := activeModuleFor(regionOf(auth))
+	if errModule != nil {
+		t.Fatalf("load signing module: %v", errModule)
+	}
+	e2eChat(t, &auth, target, module)
 }
 
 // e2eDiscoverModels signs and sends the model list, returning the parsed models
@@ -93,6 +97,11 @@ func e2eDiscoverModels(t *testing.T, auth *qoderAuth) ([]pluginapi.ModelInfo, st
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	defer cancel()
+
+	module, errModule := activeModuleFor(regionOf(*auth))
+	if errModule != nil {
+		t.Fatalf("load signing module: %v", errModule)
+	}
 
 	signed, err := signRequest(ctx, auth, func(s *signer) (qoderwasm.Prepared, error) {
 		return s.context.PrepareRequest(regionOf(*auth).InferHost, modelListPath, "GET", "auth", "", "")
@@ -115,7 +124,7 @@ func e2eDiscoverModels(t *testing.T, auth *qoderAuth) ([]pluginapi.ModelInfo, st
 		t.Logf("model list body: %s", truncateForLog(string(payload), 1200))
 		return nil, string(payload)
 	}
-	models := parseModels(payload)
+	models := parseModels(payload, module)
 	if len(models) == 0 {
 		models = fallbackModels(payload)
 	}
@@ -124,7 +133,7 @@ func e2eDiscoverModels(t *testing.T, auth *qoderAuth) ([]pluginapi.ModelInfo, st
 
 // e2eChat signs an infer request and reports exactly what came back, including
 // the decrypted form so the response decoder is exercised too.
-func e2eChat(t *testing.T, auth *qoderAuth, model string) {
+func e2eChat(t *testing.T, auth *qoderAuth, model string, module *qoderwasm.Module) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	defer cancel()
@@ -156,7 +165,7 @@ func e2eChat(t *testing.T, auth *qoderAuth, model string) {
 		t.Errorf("infer rejected with %d — the body shape is what needs fixing", status)
 		return
 	}
-	for i, chunk := range splitSSE(body) {
+	for i, chunk := range splitSSE(body, module) {
 		if i < 6 {
 			t.Logf("chunk %d: %s", i, truncateForLog(string(chunk.Payload), 300))
 		}

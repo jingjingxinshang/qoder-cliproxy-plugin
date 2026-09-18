@@ -30,8 +30,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +49,7 @@ import (
 const (
 	providerID = "qoder"
 	pluginName = "Qoder"
-	pluginVer  = "0.1.1"
+	pluginVer  = "0.1.2"
 
 	// loginTTL bounds how long an unapproved device code stays usable. The code
 	// is approved by hand in a browser, so this is minutes, not seconds.
@@ -58,9 +60,15 @@ const (
 	// approval before reporting "still pending" back to the panel.
 	pollBudget = 5 * time.Second
 
-	// modelListPath is the signed model list. `Encode=1` asks for the encoded
-	// response shape the CLI itself requests.
-	modelListPath = "/algo/api/v2/model/list?Encode=1"
+	// modelListPath is the signed model list, spelled the way the CLI spells it
+	// (`/api/v2/model/list?Encode=1`, or with &outerProviders= appended when the
+	// client asks for external providers).
+	//
+	// It deliberately does NOT carry the /algo prefix the final URL has: the
+	// signing module adds that itself, so writing it here reaches
+	// /algo/algo/api/v2/model/list and earns a 404 and an empty model list. The
+	// test TestSignedPathsCarryOneAlgoPrefix pins this.
+	modelListPath = "/api/v2/model/list?Encode=1"
 )
 
 // qoderAuth is the credential CPA stores for one Qoder account.
@@ -573,29 +581,50 @@ func discoverModels(raw []byte) pluginapi.ModelResponse {
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	defer cancel()
 
+	region := regionOf(auth)
+	module, errModule := activeModuleFor(region)
+	if errModule != nil {
+		warn("model discovery cannot sign: %v", errModule)
+		return pluginapi.ModelResponse{Provider: providerID}
+	}
+
 	signed, err := signRequest(ctx, &auth, func(s *signer) (qoderwasm.Prepared, error) {
-		region := regionOf(auth)
 		return s.context.PrepareRequest(region.InferHost, modelListPath, http.MethodGet, "auth", "", "")
 	})
 	if err != nil {
+		warn("model discovery signing failed: %v", err)
 		return pluginapi.ModelResponse{Provider: providerID}
 	}
 	status, payload, err := call(signed.URL, http.MethodGet, signed.Headers, nil)
-	if err != nil || status >= 400 {
+	if err != nil {
+		warn("model discovery request failed: %v (%s)", err, signed.URL)
 		return pluginapi.ModelResponse{Provider: providerID}
 	}
-	models := parseModels(payload)
+	if status >= 400 {
+		// An empty list on its own cannot be told apart from a rejected
+		// signature or a wrong path, so the failure is reported where it can be
+		// read instead of being swallowed into an empty result.
+		warn("model discovery rejected: status=%d url=%s body=%s", status, signed.URL, truncateForWarn(string(payload)))
+		return pluginapi.ModelResponse{Provider: providerID}
+	}
+	models := parseModels(payload, module)
+	if len(models) == 0 {
+		warn("model discovery returned no usable models: url=%s bytes=%d body=%s", signed.URL, len(payload), truncateForWarn(string(payload)))
+	}
 	return pluginapi.ModelResponse{Provider: providerID, Models: models, AuthUpdate: authData(auth, req.AuthID+".json")}
 }
 
 // parseModels reads the model list.
 //
-// The response is read tolerantly: the endpoint wraps the list in an envelope on
-// some clusters and returns it bare on others, and the per-model fields are
-// either snake_case or camelCase depending on the region. Only the fields that
-// matter to routing are taken; everything else is left at its zero value so the
-// host's own defaults apply.
-func parseModels(payload []byte) []pluginapi.ModelInfo {
+// The response is read tolerantly, because the encoding of the body varies: the
+// endpoint is asked for with Encode=1, and the CLI pairs decryptServerResponse
+// with parseDecryptedJson, so a body that is not JSON is run through the
+// module's decoder first. The per-model fields are then either snake_case or
+// camelCase depending on the cluster, and only the fields that matter to routing
+// are taken; everything else is left at its zero value so the host's own
+// defaults apply.
+func parseModels(payload []byte, module *qoderwasm.Module) []pluginapi.ModelInfo {
+	payload = decodeBody(payload, module)
 	candidates := [][]byte{payload}
 	var envelope struct {
 		Data    json.RawMessage `json:"data"`
@@ -671,11 +700,17 @@ func execute(raw []byte, stream bool) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	defer cancel()
 
+	region := regionOf(auth)
+	module, errModule := activeModuleFor(region)
+	if errModule != nil {
+		warn("infer cannot sign: %v", errModule)
+		return errorEnvelope("signature_error", errModule.Error(), http.StatusBadGateway), nil
+	}
 	signed, err := signRequest(ctx, &auth, func(s *signer) (qoderwasm.Prepared, error) {
-		region := regionOf(auth)
 		return s.context.PrepareInferRequest(region.InferHost, string(req.Payload), req.Model, "")
 	})
 	if err != nil {
+		warn("infer signing failed: %v", err)
 		return errorEnvelope("signature_error", err.Error(), http.StatusBadGateway), nil
 	}
 	body := []byte(signed.Body)
@@ -684,24 +719,25 @@ func execute(raw []byte, stream bool) ([]byte, error) {
 		return errorEnvelope("upstream_error", err.Error(), http.StatusBadGateway), nil
 	}
 	if status >= 400 {
+		warn("infer rejected: status=%d url=%s body=%s", status, signed.URL, truncateForWarn(string(payload)))
 		return errorEnvelope("upstream_error", string(payload), status), nil
 	}
 	if !stream {
-		return okEnvelope(pluginapi.ExecutorResponse{Payload: payload, Headers: jsonHeaders()})
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: decodeBody(payload, module), Headers: jsonHeaders()})
 	}
-	return okEnvelope(streamResponse{Headers: sseHeaders(), Chunks: splitSSE(payload)})
+	return okEnvelope(streamResponse{Headers: sseHeaders(), Chunks: splitSSE(payload, module)})
 }
 
 // splitSSE turns a buffered event stream into the host's chunk list, decrypting
 // each data payload where the module can.
-func splitSSE(payload []byte) []pluginapi.ExecutorStreamChunk {
+func splitSSE(payload []byte, module *qoderwasm.Module) []pluginapi.ExecutorStreamChunk {
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0, 16)
 	for _, block := range bytes.Split(payload, []byte("\n\n")) {
 		trimmed := bytes.TrimSpace(block)
 		if len(trimmed) == 0 {
 			continue
 		}
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: decryptChunk(trimmed)})
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: decryptChunk(trimmed, module)})
 	}
 	if len(chunks) == 0 && len(payload) > 0 {
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
@@ -711,16 +747,16 @@ func splitSSE(payload []byte) []pluginapi.ExecutorStreamChunk {
 
 // decryptChunk replaces the data payload of one SSE block with its decrypted
 // form when the module recognises it.
-func decryptChunk(block []byte) []byte {
+func decryptChunk(block []byte, module *qoderwasm.Module) []byte {
 	const prefix = "data:"
 	text := string(block)
 	idx := strings.Index(text, prefix)
-	if idx < 0 {
+	if idx < 0 || module == nil {
 		return block
 	}
 	head := text[:idx+len(prefix)+1]
 	value := strings.TrimSpace(text[idx+len(prefix):])
-	plain, err := activeModule().DecryptServerResponse(value)
+	plain, err := module.DecryptServerResponse(value)
 	if err != nil || plain == "" || plain == value {
 		return block
 	}
@@ -730,7 +766,6 @@ func decryptChunk(block []byte) []byte {
 func jsonHeaders() http.Header {
 	return http.Header{"Content-Type": []string{"application/json"}}
 }
-
 func sseHeaders() http.Header {
 	return http.Header{"Content-Type": []string{"text/event-stream"}, "Cache-Control": []string{"no-cache"}}
 }
@@ -851,4 +886,44 @@ func shortID(value string) string {
 		return trimmed
 	}
 	return trimmed[:8]
+}
+
+// warn reports a failure the host cannot see in a response payload.
+//
+// Discovery has no error channel — an empty model list is the only signal the
+// host gets — so a rejected signature and a wrong path look identical from
+// outside. Writing the reason to stderr puts it in the process log, which is the
+// only place it can be read from.
+func warn(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[qoder] "+format+"\n", args...)
+}
+
+func truncateForWarn(value string) string {
+	const limit = 600
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "...[truncated]"
+}
+
+// decodeBody returns the response body as JSON, decrypting it first when it is
+// not already JSON.
+//
+// The requests go out with Encode=1, and the CLI pairs decryptServerResponse
+// with parseDecryptedJson, so an encoded body is expected on at least some
+// paths. A body that does not look like JSON and does not decrypt is returned
+// unchanged, which keeps plain responses (the common case) untouched.
+func decodeBody(payload []byte, module *qoderwasm.Module) []byte {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || json.Valid(trimmed) || module == nil {
+		return payload
+	}
+	plain, err := module.DecryptServerResponse(string(trimmed))
+	if err != nil || plain == "" {
+		return payload
+	}
+	if decrypted := bytes.TrimSpace([]byte(plain)); json.Valid(decrypted) {
+		return decrypted
+	}
+	return payload
 }

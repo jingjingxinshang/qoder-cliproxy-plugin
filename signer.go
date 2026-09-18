@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -13,36 +12,52 @@ import (
 )
 
 // The signing wasm is a shared artefact: one module instance serves every
-// credential, and each request gets its own signing context because a context
-// carries the state (nonces, timestamps) that makes one signature distinct from
-// the next. Loading is done once and cached; a context is cheap.
+// credential of a cluster, and each request gets its own signing context because
+// a context carries the state (nonces, timestamps) that makes one signature
+// distinct from the next. Loading is done once per cluster and cached; a context
+// is cheap.
+//
+// The cache is keyed by the cluster's npm package rather than being a single
+// sync.Once, because Manager.Resolve cannot load anything without being told
+// which package to fetch, and the two clusters publish different ones. Asking for
+// a module without a package fails with "no npm package configured for this
+// qoder region", which is silent on the plugin's side because discovery only
+// reports an empty model list.
 var (
-	moduleOnce sync.Once
-	moduleVal  *qoderwasm.Module
-	moduleErr  error
+	moduleMu sync.Mutex
+	modules  = map[string]*qoderwasm.Module{}
+	failures = map[string]error{}
 )
 
-// activeModule returns the loaded signing module, downloading and verifying the
-// wasm on first use. It is deliberately lazy: a plugin that is installed but has
-// never signed in must still register.
-func activeModule() *qoderwasm.Module {
-	moduleOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		manager := &qoderwasm.Manager{}
-		wasm, err := manager.Resolve(ctx)
-		if err != nil {
-			moduleErr = fmt.Errorf("resolve qoder signing wasm: %w", err)
-			return
-		}
-		module, err := qoderwasm.Load(ctx, wasm.Bytes)
-		if err != nil {
-			moduleErr = fmt.Errorf("load qoder signing wasm: %w", err)
-			return
-		}
-		moduleVal = module
-	})
-	return moduleVal
+// activeModuleFor returns the signing module for a cluster, downloading and
+// verifying the wasm on first use. It is deliberately lazy: a plugin that is
+// installed but has never signed in must still register.
+func activeModuleFor(region qoder.Region) (*qoderwasm.Module, error) {
+	moduleMu.Lock()
+	defer moduleMu.Unlock()
+	if module, ok := modules[region.NpmPackage]; ok {
+		return module, nil
+	}
+	if failure, ok := failures[region.NpmPackage]; ok {
+		return nil, failure
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	manager := &qoderwasm.Manager{Package: region.NpmPackage}
+	wasm, err := manager.Resolve(ctx)
+	if err != nil {
+		failure := fmt.Errorf("resolve qoder signing wasm for %s: %w", region.ID, err)
+		failures[region.NpmPackage] = failure
+		return nil, failure
+	}
+	module, err := qoderwasm.Load(ctx, wasm.Bytes)
+	if err != nil {
+		failure := fmt.Errorf("load qoder signing wasm for %s: %w", region.ID, err)
+		failures[region.NpmPackage] = failure
+		return nil, failure
+	}
+	modules[region.NpmPackage] = module
+	return module, nil
 }
 
 // signer is one credential's signing context.
@@ -60,14 +75,11 @@ type signer struct {
 // A credential that had no derived fields is updated in place, and the caller is
 // expected to persist it — see the AuthUpdate in model discovery.
 func signRequest(ctx context.Context, auth *qoderAuth, prepare func(*signer) (qoderwasm.Prepared, error)) (qoderwasm.Prepared, error) {
-	module := activeModule()
-	if module == nil {
-		if moduleErr != nil {
-			return qoderwasm.Prepared{}, moduleErr
-		}
-		return qoderwasm.Prepared{}, errors.New("qoder signing module is unavailable")
-	}
 	region := regionOf(*auth)
+	module, err := activeModuleFor(region)
+	if err != nil {
+		return qoderwasm.Prepared{}, err
+	}
 
 	if auth.EncryptUserInfo == "" || auth.Key == "" {
 		fields, err := module.GenerateAuthFields(credentialJSON(*auth))

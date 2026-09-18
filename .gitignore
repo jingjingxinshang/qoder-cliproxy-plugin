@@ -1,0 +1,11 @@
+# Third-party binaries and fixtures: the Qoder auth wasm is fetched at runtime
+# from the official CLI package, and the tarball is a development fixture only.
+testdata/*.tgz
+testdata/*.wasm
+*.wasm
+dist/
+*.so
+*.dylib
+*.dll
+*.h
+.DS_Store

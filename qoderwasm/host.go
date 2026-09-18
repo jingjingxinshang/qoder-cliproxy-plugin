@@ -89,9 +89,26 @@ func (e jsThrow) Error() string { return e.message }
 // errSignatureInvalid is the upstream answer when the signing context is wrong.
 var errSignatureInvalid = errors.New("signature invalid")
 
+// LoadOption configures Load.
+type LoadOption func(*loadConfig)
+
+type loadConfig struct {
+	debugInfo bool
+}
+
+// WithDebugInfo keeps function names in the compiled module so a wasm trap
+// reports where it happened. It costs memory and is meant for diagnostics.
+func WithDebugInfo() LoadOption {
+	return func(config *loadConfig) { config.debugInfo = true }
+}
+
 // Load instantiates the auth wasm. The bytes are the black box; nothing in this
 // package interprets them.
-func Load(ctx context.Context, wasm []byte) (*Module, error) {
+func Load(ctx context.Context, wasm []byte, options ...LoadOption) (*Module, error) {
+	config := loadConfig{}
+	for _, option := range options {
+		option(&config)
+	}
 	m := &Module{
 		heap:     make([]any, staticSlots),
 		freeList: nil,
@@ -101,7 +118,7 @@ func Load(ctx context.Context, wasm []byte) (*Module, error) {
 	m.heap[staticTrue] = jsBool(true)
 	m.heap[staticFalse] = jsBool(false)
 
-	r := wazero.NewRuntime(ctx)
+	r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithDebugInfoEnabled(config.debugInfo))
 	m.runtime = r
 
 	if err := m.registerImports(ctx); err != nil {

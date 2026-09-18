@@ -47,6 +47,10 @@ const (
 	staticSlots     = 1028
 )
 
+// DebugCall, when set, receives every exported call with its argument vector.
+// It exists for ABI diagnostics: a trap inside the module is otherwise opaque.
+var DebugCall func(name string, params []uint64)
+
 // Module is a loaded and instantiated auth wasm.
 type Module struct {
 	runtime  wazero.Runtime
@@ -236,6 +240,9 @@ func (m *Module) call(name string, params ...uint64) ([]uint64, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("qoder auth wasm does not export %s", name)
 	}
+	if DebugCall != nil {
+		DebugCall(name, params)
+	}
 	var (
 		results []uint64
 		errCall error
@@ -296,6 +303,9 @@ func (m *Module) free(ptr, size, align int32) {
 }
 
 // pushString copies a Go string into wasm memory, mirroring `passStringToWasm0`.
+// The caller must NOT free the result: these buffers become `String` parameters
+// on the module side, which takes ownership and drops them itself. The glue
+// frees nothing here either — it only frees values the module hands back.
 func (m *Module) pushString(value string) (int32, int32, error) {
 	data := []byte(value)
 	ptr, err := m.malloc(int32(len(data)), 1)
@@ -362,7 +372,7 @@ func (m *Module) callString1(name, arg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer m.free(ptr, length, 1)
+	// The argument is not freed: the module owns its String parameters.
 
 	if _, errCall := m.call(name, u64(area), u64(ptr), u64(length)); errCall != nil {
 		return "", errCall
@@ -382,12 +392,11 @@ func (m *Module) callString2(name, first, second string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer m.free(firstPtr, firstLen, 1)
+	// Arguments are not freed; see callResourceArgs for why.
 	secondPtr, secondLen, err := m.pushString(second)
 	if err != nil {
 		return "", err
 	}
-	defer m.free(secondPtr, secondLen, 1)
 
 	if _, errCall := m.call(name,
 		u64(area),
@@ -446,7 +455,7 @@ func (m *Module) registerImports(ctx context.Context) error {
 
 	// Primitives.
 	fn("__wbg_now_88621c9c9a4f3ffc", nil, []api.ValueType{f64}, func() float64 {
-		return float64(time.Now().UnixMilli())
+		return Now()
 	})
 	fn("__wbg___wbindgen_is_object_40c5a80572e8f9d3", []api.ValueType{i32}, []api.ValueType{i32},
 		func(idx int32) int32 { return bool32(m.isObject(m.get(idx))) })
@@ -578,7 +587,26 @@ func (m *Module) registerImports(ctx context.Context) error {
 
 // invoke adapts a plain Go function to the raw wasm stack the host module gets,
 // so each import can be written with real Go signatures.
+// DebugImport, when set, is called for every host import the module invokes,
+// before the implementation runs. It exists to be read while chasing a trap
+// inside the module: the last imports called are the ones whose return values
+// the module was about to dereference.
+var DebugImport func(name string, params []uint64)
+
+// Now supplies the wall clock the module signs with, mirroring the glue's
+// `__wbg_now_...: function() { return Date.now() }` (milliseconds since the
+// epoch, as a double). It is a variable because the signing result varies with
+// it, which is worth being able to pin from a test.
+var Now = func() float64 { return float64(time.Now().UnixMilli()) }
+
 func (m *Module) invoke(name string, params, results []api.ValueType, stack []uint64, impl any) {
+	if DebugImport != nil {
+		n := len(params)
+		if n > len(stack) {
+			n = len(stack)
+		}
+		DebugImport(name, append([]uint64(nil), stack[:n]...))
+	}
 	switch f := impl.(type) {
 	case func():
 		f()

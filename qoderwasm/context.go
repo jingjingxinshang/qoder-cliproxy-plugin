@@ -147,7 +147,7 @@ func (c *QoderContext) RefreshAuthFields(credentialJSON string) error {
 	if err != nil {
 		return err
 	}
-	defer c.module.free(ptr, length, 1)
+	// Not freed: the module takes ownership of its String parameters.
 
 	if _, errCall := c.module.call("qodercontext_refreshAuthFields", u64(area), u64(c.handle), u64(ptr), u64(length)); errCall != nil {
 		return errCall
@@ -188,6 +188,14 @@ func (m *Module) callResourceMethod(name string, this int32, args ...string) (in
 // strings are passed as null, exactly as the glue does with `Iq(x) ? 0 : ...`,
 // because several of these arguments are optional. A zero receiver means "no
 // receiver", which is how the constructor is called.
+//
+// The argument buffers are deliberately not freed: wasm-bindgen generates
+// `String` parameters, so the module takes ownership of them and drops them
+// itself. The generated glue's `finally` block restores the stack pointer and
+// nothing else. Freeing them here hands the module's allocator a pointer it
+// already owns, which corrupts the heap quietly and only shows up later, as an
+// out-of-bounds trap inside the next export that allocates. That double free is
+// what made prepareRequest look like it could not sign at all.
 func (m *Module) callResourceArgs(name string, this int32, args []string) (int32, error) {
 	area, err := m.stackPush()
 	if err != nil {
@@ -199,27 +207,17 @@ func (m *Module) callResourceArgs(name string, this int32, args []string) (int32
 	if this != 0 {
 		params = append(params, u64(this))
 	}
-	var releases []func()
 	for _, arg := range args {
 		if arg == "" {
 			params = append(params, 0, 0)
 			continue
 		}
-		ptr, length, err := m.pushString(arg)
-		if err != nil {
-			for _, release := range releases {
-				release()
-			}
-			return 0, err
+		ptr, length, errPush := m.pushString(arg)
+		if errPush != nil {
+			return 0, errPush
 		}
-		releases = append(releases, func() { m.free(ptr, length, 1) })
 		params = append(params, u64(ptr), u64(length))
 	}
-	defer func() {
-		for _, release := range releases {
-			release()
-		}
-	}()
 
 	if _, errCall := m.call(name, params...); errCall != nil {
 		return 0, errCall

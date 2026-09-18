@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 )
 
@@ -29,39 +28,33 @@ func authWasmPath() string {
 	return ""
 }
 
-var (
-	sharedOnce sync.Once
-	sharedMod  *Module
-	sharedErr  error
-)
-
+// testModule loads a private instance per test.
+//
+// Sharing one instance was a mistake: a wasm trap leaves the module's state
+// undefined, so the first failure cascaded into every later test and hid where
+// the real problem was. Loading costs ~0.2s, which isolation is worth.
 func testModule(t *testing.T) *Module {
 	t.Helper()
 	path := authWasmPath()
 	if path == "" {
 		t.Skip("qoder auth wasm not available (set QODER_AUTH_WASM or add testdata/qoder_auth_wasm_bg.wasm)")
 	}
-	sharedOnce.Do(func() {
-		wasm, err := os.ReadFile(path)
-		if err != nil {
-			sharedErr = err
-			return
-		}
-		sharedMod, sharedErr = Load(context.Background(), wasm)
-	})
-	if sharedErr != nil {
-		t.Fatalf("load auth wasm: %v", sharedErr)
+	wasmBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
 	}
-	if sharedMod == nil {
-		t.Skip("qoder auth wasm not available")
+	mod, err := Load(context.Background(), wasmBytes)
+	if err != nil {
+		t.Fatalf("load auth wasm: %v", err)
 	}
-	return sharedMod
+	t.Cleanup(func() { _ = mod.Close(context.Background()) })
+	return mod
 }
 
 const sampleUserInfo = `{"uid":"9000000001","name":"tester","security_oauth_token":"oauth-token",` +
 	`"access_token":"oauth-token","refresh_token":"refresh-token","expire_time":1893456000,` +
 	`"refresh_token_expire_time":1924992000,"login_method":"browser","login_timestamp":1700000000,` +
-	`"organization_id":"org-1","organization_tags":"tags","data_policy_agreed":true,` +
+	`"organization_id":"org-1","organization_tags":["tag-a"],"data_policy_agreed":true,` +
 	`"encrypt_user_info":"","key":""}`
 
 // The signed request path depends on this call: without the two derived fields

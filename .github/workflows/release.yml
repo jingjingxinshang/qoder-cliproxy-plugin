@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: so
+          - goos: linux
+            goarch: arm64
+            ext: so
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - name: Install cross compilers
+        if: matrix.goos == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu
+      - name: Build plugin
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+        run: |
+          if [ "$GOOS/$GOARCH" = "linux/arm64" ]; then export CC=aarch64-linux-gnu-gcc; fi
+          if [ "$GOOS/$GOARCH" = "linux/amd64" ]; then export CC=x86_64-linux-gnu-gcc; fi
+          raw="qoder-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}"
+          archive="qoder_${GITHUB_REF_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          go build -buildmode=c-shared -o "$raw" .
+          rm -f "${raw%.*}.h"
+          mkdir package
+          cp "$raw" package/qoder.so
+          (cd package && zip -q -j "../$archive" qoder.so)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qoder-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: qoder_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+  release:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum *.zip > checksums.txt
+          # CPA looks up checksums by bare release asset name, so no path prefix allowed.
+          if grep -q '/' checksums.txt; then
+            echo "checksums.txt must not contain path separators" >&2
+            cat checksums.txt >&2
+            exit 1
+          fi
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
